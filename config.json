@@ -10,9 +10,9 @@
     
     "mqtt": {
         "enabled": true,
-        "broker_host": "localhost",
-        "broker_port": 1883,
-        "use_ssl": false,
+        "broker_host": "mqtt.gomama.com.sg",
+        "broker_port": 35883,
+        "use_ssl": true,
         "ssl_ca_cert": null,
         "ssl_cert_file": null,
         "ssl_key_file": null,

@@ -185,13 +185,9 @@ def connect_mqtt() -> bool:
         return False
 
     try:
-        # Generate authentication credentials
-        timestamp = int(time.time())
-        auth_hash = generate_api_key_hashed(config.get_api_key(), config.get_pi_id(), timestamp)
-
-        username = config.get_mqtt_username()
-        password = config.get_mqtt_password(timestamp, auth_hash)
-
+        # Set credentials (use simple credentials like Flutter app)
+        username = "adonisjs_client"
+        password = "adonisjs_pass"
         mqtt_client.username_pw_set(username, password)
 
         # Connect to broker
