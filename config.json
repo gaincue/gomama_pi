@@ -1,0 +1,40 @@
+{
+    "api_key": "asdfghjkl123",
+    "listing_id": "1013995107100112091",
+    "pi_id": "10000000858d537d",
+    "apn": "M1-NBIOT",
+    "usb_port": "/dev/ttyUSB3",
+    "baud_rate": 115200,
+    "url_dev": "https://asia-southeast1-gomama-dev.cloudfunctions.net/processListingRaspberryPiLogs",
+    "url": "https://asia-southeast1-gomama-prod.cloudfunctions.net/processListingRaspberryPiLogs",
+    
+    "mqtt": {
+        "enabled": true,
+        "broker_host": "localhost",
+        "broker_port": 1883,
+        "use_ssl": false,
+        "ssl_ca_cert": null,
+        "ssl_cert_file": null,
+        "ssl_key_file": null,
+        
+        "username_format": "pi_{listing_id}_{pi_id}",
+        "password_format": "{timestamp}:{auth_hash}",
+        
+        "topic_prefix": "gomama/devices",
+        "sensor_data_topic": "gomama/devices/{listing_id}/sensor_data",
+        "status_topic": "gomama/devices/{listing_id}/status",
+        "commands_topic": "gomama/devices/{listing_id}/commands",
+        
+        "qos": 1,
+        "retain": false,
+        "keepalive": 60,
+        "connect_timeout": 10,
+        "reconnect_delay": 5,
+        "max_reconnect_attempts": 10,
+        "offline_buffer_size": 100
+    },
+    
+    "fallback_to_http": true,
+    "send_interval_seconds": 1,
+    "debug_mode": false
+}

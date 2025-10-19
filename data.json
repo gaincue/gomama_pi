@@ -1,0 +1,14 @@
+{
+    "listing_id": "1013995107100112091",
+    "timestamp": 1752756597.5593922,
+    "is_disinfecting": false,
+    "is_door_opened": false,
+    "is_occupied": false,
+    "is_led_light_on": false,
+    "is_fan_on": false,
+    "is_scheduled": false,
+    "is_uvc_lamp_on": false,
+    "temperature": 28.0,
+    "humidity": 56.1,
+    "is_send_data": true
+}

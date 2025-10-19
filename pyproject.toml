@@ -1,0 +1,27 @@
+[project]
+name = "gomama-pi"
+version = "0.1.0"
+description = "GoMama Raspberry Pi sensor data collection and MQTT publishing"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "paho-mqtt>=1.6.1",
+    "requests>=2.28.0",
+    "coloredlogs>=15.0",
+    "pytz>=2022.1",
+    "pyserial>=3.5",
+    "typing_extensions>=4.0.0"
+]
+
+[project.optional-dependencies]
+pi = [
+    "RPi.GPIO>=0.7.1",
+    "adafruit-circuitpython-dht>=3.7.0",
+    "board>=1.0"
+]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "flake8>=5.0.0",
+    "mypy>=0.991"
+]
