@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
-# -*- coding:utf-8 -*-
+"""
+Fixed version of send.py with better MQTT handling and fallback options
+"""
 
 import json
 import logging
 import time
 import threading
+import signal
+import sys
 from collections import deque
 from typing import Optional, Dict, Any
 
 import coloredlogs
 import requests
-import paho.mqtt.client as mqtt
+
+# Try to import paho.mqtt with fallback
+MQTT_AVAILABLE = True
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:
+    MQTT_AVAILABLE = False
+    print("⚠️ paho-mqtt not available, using HTTP-only mode")
 
 from helper import *
 from mqtt_config import get_config
@@ -48,70 +59,71 @@ mqtt_client: Optional[mqtt.Client] = None
 mqtt_connected = False
 mqtt_connection_attempts = 0
 offline_message_queue = deque(maxlen=config.get_mqtt_offline_buffer_size())
+mqtt_enabled = MQTT_AVAILABLE and config.is_mqtt_enabled()
 
 logger = logging.getLogger(__name__)
 coloredlogs.install(level=logging.DEBUG, logger=logger, fmt="%(name)s - %(levelname)s - %(message)s")
-logging.getLogger().setLevel(logging.INFO)
-logging.getLogger().setLevel(logging.WARNING)
-logging.getLogger().setLevel(logging.ERROR)
 
+# Graceful shutdown handling
+shutdown_requested = False
 
-# MQTT Event Callbacks
-def on_mqtt_connect(client, userdata, flags, rc):
-    """Callback for when MQTT client connects"""
-    global mqtt_connected, mqtt_connection_attempts
+def signal_handler(sig, frame):
+    global shutdown_requested
+    logger.info("🛑 Shutdown signal received")
+    shutdown_requested = True
 
-    if rc == 0:
-        mqtt_connected = True
-        mqtt_connection_attempts = 0
-        logger.info("✅ MQTT connected successfully")
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
-        # Subscribe to commands topic
-        commands_topic = config.get_commands_topic()
-        client.subscribe(commands_topic, qos=config.get_mqtt_qos())
-        logger.info(f"📡 Subscribed to commands topic: {commands_topic}")
+# MQTT Event Callbacks (only if MQTT is available)
+if MQTT_AVAILABLE:
+    def on_mqtt_connect(client, userdata, flags, rc):
+        """Callback for when MQTT client connects"""
+        global mqtt_connected, mqtt_connection_attempts
 
-        # Process any queued offline messages
-        process_offline_queue()
+        if rc == 0:
+            mqtt_connected = True
+            mqtt_connection_attempts = 0
+            logger.info("✅ MQTT connected successfully")
 
-    else:
+            # Subscribe to commands topic
+            commands_topic = config.get_commands_topic()
+            client.subscribe(commands_topic, qos=config.get_mqtt_qos())
+            logger.info(f"📡 Subscribed to commands topic: {commands_topic}")
+
+            # Process any queued offline messages
+            process_offline_queue()
+
+        else:
+            mqtt_connected = False
+            mqtt_connection_attempts += 1
+            logger.error(f"❌ MQTT connection failed with code {rc}")
+
+    def on_mqtt_disconnect(client, userdata, rc):
+        """Callback for when MQTT client disconnects"""
+        global mqtt_connected
         mqtt_connected = False
-        mqtt_connection_attempts += 1
-        logger.error(f"❌ MQTT connection failed with code {rc}")
 
+        if rc != 0:
+            logger.warning(f"⚠️ MQTT unexpected disconnection (code: {rc})")
+        else:
+            logger.info("🔌 MQTT disconnected gracefully")
 
-def on_mqtt_disconnect(client, userdata, rc):
-    """Callback for when MQTT client disconnects"""
-    global mqtt_connected
-    mqtt_connected = False
+    def on_mqtt_message(client, userdata, msg):
+        """Callback for when MQTT message is received"""
+        try:
+            topic = msg.topic
+            payload = json.loads(msg.payload.decode())
+            logger.info(f"📨 MQTT message received on {topic}: {payload}")
 
-    if rc != 0:
-        logger.warning(f"⚠️ MQTT unexpected disconnection (code: {rc})")
-    else:
-        logger.info("🔌 MQTT disconnected gracefully")
+            # Handle commands from server
+            if topic == config.get_commands_topic():
+                handle_mqtt_command(payload)
 
-
-def on_mqtt_message(client, userdata, msg):
-    """Callback for when MQTT message is received"""
-    try:
-        topic = msg.topic
-        payload = json.loads(msg.payload.decode())
-        logger.info(f"📨 MQTT message received on {topic}: {payload}")
-
-        # Handle commands from server
-        if topic == config.get_commands_topic():
-            handle_mqtt_command(payload)
-
-    except json.JSONDecodeError:
-        logger.error(f"❌ Invalid JSON in MQTT message: {msg.payload}")
-    except Exception as e:
-        logger.error(f"❌ Error processing MQTT message: {e}")
-
-
-def on_mqtt_publish(client, userdata, mid):
-    """Callback for when MQTT message is published"""
-    logger.debug(f"📤 MQTT message published (mid: {mid})")
-
+        except json.JSONDecodeError:
+            logger.error(f"❌ Invalid JSON in MQTT message: {msg.payload}")
+        except Exception as e:
+            logger.error(f"❌ Error processing MQTT message: {e}")
 
 def handle_mqtt_command(command: Dict[str, Any]):
     """Handle commands received via MQTT"""
@@ -119,61 +131,90 @@ def handle_mqtt_command(command: Dict[str, Any]):
 
     if command_type == "ping":
         logger.info("🏓 Received ping command")
-        # Could respond with pong if needed
     elif command_type == "restart":
         logger.warning("🔄 Received restart command")
-        # Could implement restart logic
     else:
         logger.warning(f"❓ Unknown command type: {command_type}")
 
-
-# MQTT Helper Functions
-def init_mqtt_client() -> Optional[mqtt.Client]:
-    """Initialize MQTT client with configuration"""
-    global mqtt_client
-
+def create_mqtt_client_safe() -> Optional[mqtt.Client]:
+    """Safely create MQTT client with timeout protection"""
+    if not MQTT_AVAILABLE:
+        logger.info("📴 MQTT library not available")
+        return None
+        
     if not config.is_mqtt_enabled():
         logger.info("📴 MQTT is disabled in configuration")
         return None
 
     try:
-        # Create MQTT client
         client_id = f"gomama_pi_{config.get_listing_id()}_{int(time.time())}"
-        mqtt_client = mqtt.Client(client_id=client_id)
+        logger.info(f"🆔 Creating MQTT client: {client_id}")
+        
+        # Create client with timeout protection
+        client_created = threading.Event()
+        creation_error = None
+        created_client = None
+        
+        def create_client():
+            nonlocal creation_error, created_client
+            try:
+                logger.info("⏳ Calling mqtt.Client()...")
+                created_client = mqtt.Client(client_id=client_id)
+                logger.info("✅ MQTT client instance created")
+                client_created.set()
+            except Exception as e:
+                creation_error = e
+                logger.error(f"❌ MQTT client creation failed: {e}")
+                client_created.set()
+        
+        # Run client creation in separate thread with timeout
+        thread = threading.Thread(target=create_client, daemon=True)
+        thread.start()
+        
+        # Wait for completion with timeout
+        if not client_created.wait(timeout=10):
+            logger.error("❌ MQTT client creation timed out after 10 seconds!")
+            logger.error("💡 Falling back to HTTP-only mode")
+            return None
+        
+        if creation_error:
+            logger.error(f"❌ Client creation error: {creation_error}")
+            return None
+            
+        if not created_client:
+            logger.error("❌ Client creation failed - no client instance")
+            return None
 
         # Set callbacks
-        mqtt_client.on_connect = on_mqtt_connect
-        mqtt_client.on_disconnect = on_mqtt_disconnect
-        mqtt_client.on_message = on_mqtt_message
-        mqtt_client.on_publish = on_mqtt_publish
+        created_client.on_connect = on_mqtt_connect
+        created_client.on_disconnect = on_mqtt_disconnect
+        created_client.on_message = on_mqtt_message
 
         # Configure SSL if enabled
         if config.get_mqtt_use_ssl():
-            ssl_config = config.get_mqtt_ssl_config()
-            mqtt_client.tls_set(
-                ca_certs=ssl_config["ca_cert"],
-                certfile=ssl_config["cert_file"],
-                keyfile=ssl_config["key_file"],
-            )
-            logger.info("🔒 MQTT SSL/TLS configured")
+            try:
+                created_client.tls_set()
+                logger.info("🔒 MQTT SSL/TLS configured")
+            except Exception as e:
+                logger.error(f"❌ SSL configuration failed: {e}")
+                return None
 
-        # Set keepalive
-        mqtt_client.keepalive = config.get_mqtt_keepalive()
-
-        logger.info(f"🚀 MQTT client initialized: {client_id}")
-        return mqtt_client
+        logger.info(f"🚀 MQTT client created successfully: {client_id}")
+        return created_client
 
     except Exception as e:
-        logger.error(f"❌ Failed to initialize MQTT client: {e}")
+        logger.error(f"❌ Failed to create MQTT client: {e}")
         return None
 
+def connect_mqtt_safe() -> bool:
+    """Safely connect to MQTT broker with timeout protection"""
+    global mqtt_client, mqtt_connection_attempts, mqtt_connected
 
-def connect_mqtt() -> bool:
-    """Connect to MQTT broker"""
-    global mqtt_client, mqtt_connection_attempts
+    if not MQTT_AVAILABLE or not config.is_mqtt_enabled():
+        return False
 
     if not mqtt_client:
-        mqtt_client = init_mqtt_client()
+        mqtt_client = create_mqtt_client_safe()
         if not mqtt_client:
             return False
 
@@ -185,28 +226,63 @@ def connect_mqtt() -> bool:
         return False
 
     try:
-        # Set credentials (use simple credentials like Flutter app)
+        # Set credentials
         username = "adonisjs_client"
         password = "adonisjs_pass"
         mqtt_client.username_pw_set(username, password)
 
-        # Connect to broker
         logger.info(f"🔌 Connecting to MQTT broker: {config.get_mqtt_broker_host()}:{config.get_mqtt_broker_port()}")
-        mqtt_client.connect(
-            config.get_mqtt_broker_host(),
-            config.get_mqtt_broker_port(),
-            config.get_mqtt_keepalive(),
-        )
+        
+        # Connect with timeout protection
+        connection_done = threading.Event()
+        connect_error = None
+        
+        def connect():
+            nonlocal connect_error
+            try:
+                result = mqtt_client.connect(
+                    config.get_mqtt_broker_host(),
+                    config.get_mqtt_broker_port(),
+                    config.get_mqtt_keepalive(),
+                )
+                if result == 0:
+                    logger.info("✅ MQTT connect() call successful")
+                    mqtt_client.loop_start()
+                else:
+                    connect_error = f"Connect returned error code: {result}"
+                connection_done.set()
+            except Exception as e:
+                connect_error = str(e)
+                connection_done.set()
+        
+        # Run connection in separate thread with timeout
+        thread = threading.Thread(target=connect, daemon=True)
+        thread.start()
+        
+        # Wait for connection attempt with timeout
+        if not connection_done.wait(timeout=15):
+            logger.error("❌ MQTT connection attempt timed out after 15 seconds!")
+            mqtt_connection_attempts += 1
+            return False
+        
+        if connect_error:
+            logger.error(f"❌ MQTT connection error: {connect_error}")
+            mqtt_connection_attempts += 1
+            return False
 
-        # Start network loop in background
-        mqtt_client.loop_start()
-
-        # Wait for connection with timeout
+        # Wait for connection callback with timeout
         timeout = config.get_mqtt_connect_timeout()
         start_time = time.time()
 
         while not mqtt_connected and (time.time() - start_time) < timeout:
+            if shutdown_requested:
+                return False
             time.sleep(0.1)
+
+        if not mqtt_connected:
+            logger.error(f"❌ MQTT connection callback timeout after {timeout}s")
+            mqtt_connection_attempts += 1
+            return False
 
         return mqtt_connected
 
@@ -215,12 +291,11 @@ def connect_mqtt() -> bool:
         mqtt_connection_attempts += 1
         return False
 
-
 def publish_mqtt_message(topic: str, payload: Dict[str, Any]) -> bool:
     """Publish message via MQTT"""
     global mqtt_client
 
-    if not mqtt_connected or not mqtt_client:
+    if not MQTT_AVAILABLE or not mqtt_connected or not mqtt_client:
         # Queue message for later if offline
         if len(offline_message_queue) < config.get_mqtt_offline_buffer_size():
             offline_message_queue.append((topic, payload, time.time()))
@@ -249,7 +324,6 @@ def publish_mqtt_message(topic: str, payload: Dict[str, Any]) -> bool:
         logger.error(f"❌ MQTT publish error: {e}")
         return False
 
-
 def process_offline_queue():
     """Process queued offline messages"""
     global offline_message_queue
@@ -272,11 +346,10 @@ def process_offline_queue():
             offline_message_queue.appendleft((topic, payload, queued_time))
             break
 
-
-# Initialise config
+# Data handling functions (same as original)
 def init_config():
     global api_key, apn, pod_id, pi_id, usb_port, baud_rate, url, timestamp
-    with open("/home/pi/Desktop/gomama-raspberrypi/config.json") as f:
+    with open("/Users/kkcy/development/gomama/gomama2.0/gomama_pi/config.json") as f:
         try:
             data = json.load(f)
             if "api_key" in data:
@@ -295,16 +368,11 @@ def init_config():
             logger.error("JSON Decode Error", err)
             pass
 
-
 def init_data():
     global listing_data, listing_id, timestamp, is_disinfecting, is_door_opened, is_occupied, is_led_light_on, is_fan_on, is_scheduled, is_uvc_lamp_on, temperature, humidity, is_send_data
-    with open('/home/pi/Desktop/gomama-raspberrypi/data.json') as f:
+    with open('/Users/kkcy/development/gomama/gomama2.0/gomama_pi/data.json') as f:
         try:
             data = json.load(f)
-            # listing_data = 1013995107100112091
-            # listing_data = data
-            # if '1013995107100112091' in data:
-                # listing_id = data['listing_id']
             if 'timestamp' in data:
                 timestamp = data['timestamp']
             if 'is_disinfecting' in data:
@@ -332,7 +400,6 @@ def init_data():
             if listing_data:
                 write_data(listing_data)
 
-
 def post_https(pi_key_hashed):
     https_headers = {
         'Authorization': f'Bearer {pi_key_hashed}',
@@ -359,11 +426,12 @@ def post_https(pi_key_hashed):
         logger.error("Error")
         pass
 
-
 def send_data_mqtt() -> bool:
     """Send sensor data via MQTT"""
+    if not MQTT_AVAILABLE:
+        return False
+        
     try:
-        # Prepare sensor data payload
         timestamp = int(time.time())
         auth_hash = generate_api_key_hashed(config.get_api_key(), config.get_pi_id(), timestamp)
 
@@ -384,7 +452,6 @@ def send_data_mqtt() -> bool:
             },
         }
 
-        # Publish to sensor data topic
         topic = config.get_sensor_data_topic()
         success = publish_mqtt_message(topic, sensor_data_payload)
 
@@ -399,11 +466,9 @@ def send_data_mqtt() -> bool:
         logger.error(f"❌ Error sending MQTT data: {e}")
         return False
 
-
 def send_data_http() -> bool:
     """Send sensor data via HTTP (fallback)"""
     try:
-        # Prepare data in legacy format
         listing_data["listing_id"] = config.get_listing_id()
         listing_data["timestamp"] = loop_timestamp
         listing_data["is_disinfecting"] = is_disinfecting
@@ -417,18 +482,15 @@ def send_data_http() -> bool:
         listing_data["humidity"] = humidity
         listing_data["is_send_data"] = False
 
-        # Generate authentication hash
         pi_key_hashed = generate_api_key_hashed(config.get_api_key(), config.get_pi_id(), loop_timestamp)
 
-        # Send via HTTP
-        logger.info("📡 Sending data via HTTP fallback...")
+        logger.info("📡 Sending data via HTTP...")
         post_https(pi_key_hashed)
         return True
 
     except Exception as e:
         logger.error(f"❌ Error sending HTTP data: {e}")
         return False
-
 
 def update_and_send_data():
     """Main data sending function with MQTT and HTTP fallback"""
@@ -437,7 +499,6 @@ def update_and_send_data():
     logger.info("📊 Updating and sending sensor data...")
     init_data()
 
-    # Log current sensor readings
     if config.is_debug_mode():
         logger.debug(
             f"Sensor readings: occupied={is_occupied}, disinfecting={is_disinfecting}, "
@@ -446,11 +507,11 @@ def update_and_send_data():
 
     success = False
 
-    # Try MQTT first if enabled
-    if config.is_mqtt_enabled():
+    # Try MQTT first if enabled and available
+    if mqtt_enabled:
         if not mqtt_connected:
             logger.info("🔌 Attempting to connect to MQTT broker...")
-            connect_mqtt()
+            connect_mqtt_safe()
 
         if mqtt_connected:
             success = send_data_mqtt()
@@ -469,10 +530,9 @@ def update_and_send_data():
 
     return success
 
-
 def start_send_module():
-    """Main application loop with MQTT and HTTP support"""
-    global is_send_data, loop_timestamp, mqtt_client
+    """Main application loop with improved error handling"""
+    global is_send_data, loop_timestamp, mqtt_client, shutdown_requested
 
     logger.info("🚀 Starting GoMama Pi sensor data module...")
 
@@ -482,16 +542,19 @@ def start_send_module():
     # Initialize configuration
     init_config()
 
-    # Initialize MQTT if enabled
-    if config.is_mqtt_enabled():
+    # Initialize MQTT if enabled and available
+    if mqtt_enabled:
         logger.info("📡 Initializing MQTT client...")
-        mqtt_client = init_mqtt_client()
+        mqtt_client = create_mqtt_client_safe()
         if mqtt_client:
-            connect_mqtt()
+            connect_mqtt_safe()
         else:
-            logger.error("❌ Failed to initialize MQTT client")
+            logger.warning("⚠️ MQTT initialization failed, using HTTP-only mode")
     else:
-        logger.info("📴 MQTT disabled, using HTTP only")
+        if not MQTT_AVAILABLE:
+            logger.info("📴 MQTT library not available, using HTTP-only mode")
+        else:
+            logger.info("📴 MQTT disabled, using HTTP-only mode")
 
     # Main loop
     loop_timestamp = time.time()
@@ -500,7 +563,7 @@ def start_send_module():
     logger.info(f"🔄 Starting main loop (interval: {send_interval}s)")
 
     try:
-        while True:
+        while not shutdown_requested:
             time.sleep(0.2)  # Short sleep for responsiveness
 
             current_time = time.time()
@@ -523,26 +586,28 @@ def start_send_module():
 
     except KeyboardInterrupt:
         logger.info("🛑 Received interrupt signal, shutting down...")
-        shutdown_gracefully()
     except Exception as e:
         logger.error(f"❌ Unexpected error in main loop: {e}")
+    finally:
         shutdown_gracefully()
-
 
 def shutdown_gracefully():
     """Graceful shutdown procedure"""
-    global mqtt_client
+    global mqtt_client, shutdown_requested
 
+    shutdown_requested = True
     logger.info("🔄 Shutting down gracefully...")
 
     # Disconnect MQTT client
-    if mqtt_client and mqtt_connected:
+    if MQTT_AVAILABLE and mqtt_client and mqtt_connected:
         logger.info("🔌 Disconnecting MQTT client...")
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+        try:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+        except Exception as e:
+            logger.error(f"❌ Error during MQTT disconnect: {e}")
 
     logger.info("✅ Shutdown complete")
-
 
 if __name__ == "__main__":
     start_send_module()
